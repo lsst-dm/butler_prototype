@@ -99,9 +99,15 @@ class MySqlDatabase(Database):
         return self._shrinker.expand(shrunk)
 
     def replace(self, table: sqlalchemy.schema.Table, *rows: dict) -> None:
-        # This is all wrong
         if not self.isWriteable():
             raise ReadOnlyDatabaseError(f"Attempt to replace into read-only database '{self}'.")
         if not rows:
             return
-        raise NotImplementedError("No support for replace in MySQL")
+        # This uses special support for UPSERT in MySQL backend:
+        # https://docs.sqlalchemy.org/en/13/dialects/mysql.html#insert-on-duplicate-key-update-upsert
+        query = sqlalchemy.dialects.mysql.dml.insert(table)
+        data = {column.name: getattr(query.inserted, column.name)
+                for column in table.columns
+                if hasattr(query.inserted, column.name)}
+        query = query.on_duplicate_key_update(**data)
+        self._connection.execute(query, *rows)
