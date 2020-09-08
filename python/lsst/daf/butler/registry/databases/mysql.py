@@ -23,7 +23,7 @@ from __future__ import annotations
 __all__ = ["MySqlDatabase"]
 
 from contextlib import contextmanager, closing
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Iterable
 
 import sqlalchemy
 
@@ -77,6 +77,11 @@ class MySqlDatabase(Database):
     def fromConnection(cls, connection: sqlalchemy.engine.Connection, *, origin: int,
                        namespace: Optional[str] = None, writeable: bool = True) -> Database:
         return cls(connection=connection, origin=origin, namespace=namespace, writeable=writeable)
+
+    def _lockTables(self, tables: Iterable[sqlalchemy.schema.Table] = ()) -> None:
+        # Docstring inherited.
+        for table in tables:
+            self._connection.execute(f"LOCK TABLE {table.key} IN SHARE MODE")
 
     @contextmanager
     def transaction(self, *, interrupting: bool = False) -> Iterator[None]:
