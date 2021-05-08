@@ -31,6 +31,7 @@ import tempfile
 
 from sqlalchemy import BigInteger, String
 
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -88,9 +89,6 @@ if TYPE_CHECKING:
     from lsst.daf.butler.registry.interfaces import DatasetIdRef, DatastoreRegistryBridgeManager
 
 log = logging.getLogger(__name__)
-
-# String to use when a Python None is encountered
-NULLSTR = "__NULL_STRING__"
 
 
 class _IngestPrepData(Datastore.IngestPrepData):
@@ -230,6 +228,8 @@ class FileDatastore(GenericBaseDatastore):
                 ddl.FieldSpec(name="file_size", dtype=BigInteger, nullable=True),
             ],
             unique=frozenset(),
+            indexes=[tuple(["dataset_id", "path"]), tuple(["path"]),
+                     tuple(["dataset_id", "component", "path"])],
         )
 
     def __init__(self, config: Union[DatastoreConfig, str],
@@ -344,27 +344,17 @@ class FileDatastore(GenericBaseDatastore):
         """
         if location.pathInStore.isabs():
             raise RuntimeError(f"Cannot delete artifact with absolute uri {location.uri}.")
-        log.debug("Deleting file: %s", location.uri)
-        location.uri.remove()
+
+        try:
+            location.uri.remove()
+        except Exception:
+            log.critical("Failed to delete file: %s", location.uri)
+            raise
         log.debug("Successfully deleted file: %s", location.uri)
 
     def addStoredItemInfo(self, refs: Iterable[DatasetRef], infos: Iterable[StoredFileInfo]) -> None:
         # Docstring inherited from GenericBaseDatastore
-        records = []
-        for ref, info in zip(refs, infos):
-            # Component should come from ref and fall back on info
-            component = ref.datasetType.component()
-            if component is None and info.component is not None:
-                component = info.component
-            if component is None:
-                # Use empty string since we want this to be part of the
-                # primary key.
-                component = NULLSTR
-            records.append(
-                dict(dataset_id=ref.id, formatter=info.formatter, path=info.path,
-                     storage_class=info.storageClass.name, component=component,
-                     checksum=info.checksum, file_size=info.file_size)
-            )
+        records = [info.to_record(ref) for ref, info in zip(refs, infos)]
         self._table.insert(*records)
 
     def getStoredItemsInfo(self, ref: DatasetIdRef) -> List[StoredFileInfo]:
@@ -373,23 +363,27 @@ class FileDatastore(GenericBaseDatastore):
         # Look for the dataset_id -- there might be multiple matches
         # if we have disassembled the dataset.
         records = list(self._table.fetch(dataset_id=ref.id))
+        return [StoredFileInfo.from_record(record) for record in records]
 
-        results = []
-        for record in records:
-            # Convert name of StorageClass to instance
-            storageClass = self.storageClassFactory.getStorageClass(record["storage_class"])
-            component = record["component"] if (record["component"]
-                                                and record["component"] != NULLSTR) else None
+    def _refs_associated_with_artifacts(self, paths: List[Union[str, ButlerURI]]) -> Dict[str,
+                                                                                          Set[DatasetId]]:
+        """Return paths and associated dataset refs.
 
-            info = StoredFileInfo(formatter=record["formatter"],
-                                  path=record["path"],
-                                  storageClass=storageClass,
-                                  component=component,
-                                  checksum=record["checksum"],
-                                  file_size=record["file_size"])
-            results.append(info)
+        Parameters
+        ----------
+        paths : `list` of `str` or `ButlerURI`
+            All the paths to include in search.
 
-        return results
+        Returns
+        -------
+        mapping : `dict` of [`str`, `set` [`DatasetId`]]
+            Mapping of each path to a set of associated database IDs.
+        """
+        records = list(self._table.fetch(path=[str(path) for path in paths]))
+        result = defaultdict(set)
+        for row in records:
+            result[row["path"]].add(row["dataset_id"])
+        return result
 
     def _registered_refs_per_artifact(self, pathInStore: ButlerURI) -> Set[DatasetId]:
         """Return all dataset refs associated with the supplied path.
@@ -432,15 +426,7 @@ class FileDatastore(GenericBaseDatastore):
 
         # Use the path to determine the location -- we need to take
         # into account absolute URIs in the datastore record
-        locations: List[Tuple[Location, StoredFileInfo]] = []
-        for r in records:
-            uriInStore = ButlerURI(r.path, forceAbsolute=False)
-            if uriInStore.isabs():
-                location = Location(None, uriInStore)
-            else:
-                location = self.locationFactory.fromPath(r.path)
-            locations.append((location, r))
-        return locations
+        return [(r.file_location(self.locationFactory), r) for r in records]
 
     def _can_remove_dataset_artifact(self, ref: DatasetIdRef, location: Location) -> bool:
         """Check that there is only one dataset associated with the
@@ -1647,60 +1633,78 @@ class FileDatastore(GenericBaseDatastore):
             to delete.
         """
         log.debug("Emptying trash in datastore %s", self.name)
+
         # Context manager will empty trash iff we finish it without raising.
-        with self.bridge.emptyTrash() as trashed:
-            for ref in trashed:
-                fileLocations = self._get_dataset_locations_info(ref)
+        # It will also automatically delete the relevant rows from the
+        # trash table and the records table.
+        with self.bridge.emptyTrash(self._table, record_class=StoredFileInfo,
+                                    record_column="path") as trash_data:
+            # Removing the artifacts themselves requires that the files are
+            # not also associated with refs that are not to be trashed.
+            # Therefore need to do a query with the file paths themselves
+            # and return all the refs associated with them. Can only delete
+            # a file if the refs to be trashed are the only refs associated
+            # with the file.
+            # This requires multiple copies of the trashed items
+            trashed, artifacts_to_keep = trash_data
 
-                if not fileLocations:
-                    err_msg = f"Requested dataset ({ref}) does not exist in datastore {self.name}"
-                    if ignore_errors:
-                        log.warning(err_msg)
-                        continue
-                    else:
-                        raise FileNotFoundError(err_msg)
+            if artifacts_to_keep is None:
+                # The bridge is not helping us so have to work it out
+                # ourselves. This is not going to be as efficient.
+                trashed = list(trashed)
 
-                for location, _ in fileLocations:
+                # The instance check is for mypy since up to this point it
+                # does not know the type of info.
+                path_map = self._refs_associated_with_artifacts([info.path for _, info in trashed
+                                                                 if isinstance(info, StoredFileInfo)])
 
-                    if not self._artifact_exists(location):
-                        err_msg = f"Dataset {location.uri} no longer present in datastore {self.name}"
+                for ref, info in trashed:
+                    path_map[info.path].remove(ref.id)
+                    if not path_map[info.path]:
+                        del path_map[info.path]
+
+                artifacts_to_keep = set(path_map)
+
+            for ref, info in trashed:
+
+                if info is None:
+                    # Should not happen for this implementation but need
+                    # to keep mypy happy.
+                    raise RuntimeError(f"Internal logic error in emptyTrash with ref {ref}.")
+
+                if not isinstance(info, StoredFileInfo):
+                    # Mypy needs to know this is not the base class
+                    raise RuntimeError(f"Unexpectedly got info of class {type(info)}")
+
+                if ref.id is None:
+                    # Check to keep mypy happy.
+                    raise RuntimeError(f"Internal logic error in emptyTrash with ref {ref}/{info}")
+
+                # Only trashed refs still known to datastore will be returned.
+                location = info.file_location(self.locationFactory)
+
+                # If the file itself has been deleted there is nothing we
+                # can do about it. It is possible that trash has been run
+                # in parallel in another process or someone decided to delete
+                # the file. It is unlikely to come back and so we should still
+                # continue with the removal of the entry from the trash
+                # table.
+                if not self._artifact_exists(location):
+                    log.debug("Dataset at %s with id %s no longer present in datastore %s. Continuing.",
+                              location.uri, ref.id, self.name)
+                    continue
+
+                if info.path not in artifacts_to_keep:
+                    # Point of no return for this artifact
+                    log.debug("Removing artifact %s from datastore %s", location.uri, self.name)
+                    try:
+                        self._delete_artifact(location)
+                    except Exception as e:
                         if ignore_errors:
-                            log.warning(err_msg)
-                            continue
+                            log.critical("Encountered error removing artifact %s from datastore %s: %s",
+                                         location.uri, self.name, e)
                         else:
-                            raise FileNotFoundError(err_msg)
-
-                    # Can only delete the artifact if there are no references
-                    # to the file from untrashed dataset refs.
-                    if self._can_remove_dataset_artifact(ref, location):
-                        # Point of no return for this artifact
-                        log.debug("Removing artifact %s from datastore %s", location.uri, self.name)
-                        try:
-                            self._delete_artifact(location)
-                        except Exception as e:
-                            if ignore_errors:
-                                log.critical("Encountered error removing artifact %s from datastore %s: %s",
-                                             location.uri, self.name, e)
-                            else:
-                                raise
-
-                # Now must remove the entry from the internal registry even if
-                # the artifact removal failed and was ignored,
-                # otherwise the removal check above will never be true
-                try:
-                    # There may be multiple rows associated with this ref
-                    # depending on disassembly
-                    self.removeStoredItemInfo(ref)
-                except Exception as e:
-                    if ignore_errors:
-                        log.warning("Error removing dataset %s (%s) from internal registry of %s: %s",
-                                    ref.id, location.uri, self.name, e)
-                        continue
-                    else:
-                        raise FileNotFoundError(
-                            f"Error removing dataset {ref.id} ({location.uri}) from internal registry "
-                            f"of {self.name}"
-                        ) from e
+                            raise
 
     @transactional
     def forget(self, refs: Iterable[DatasetRef]) -> None:
