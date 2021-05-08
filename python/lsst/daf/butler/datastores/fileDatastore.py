@@ -228,6 +228,8 @@ class FileDatastore(GenericBaseDatastore):
                 ddl.FieldSpec(name="file_size", dtype=BigInteger, nullable=True),
             ],
             unique=frozenset(),
+            indexes=[tuple(["dataset_id", "path"]), tuple(["path"]),
+                     tuple(["dataset_id", "component", "path"])],
         )
 
     def __init__(self, config: Union[DatastoreConfig, str],
